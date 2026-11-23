@@ -1,5 +1,11 @@
-"""FastAPI 入口：在 /docs 可完成改配、领还分区与模拟驱动回报。"""
+"""FastAPI 入口：在 /docs 可完成改配、领还分区与模拟驱动回报。
+
+启动时通过环境变量 ``GPU_COUNT`` 设置模拟卡数（默认 2），也可用
+``GPU_IDS`` 显式指定逗号分隔的卡 ID（两者同时给出时以 GPU_IDS 为准）。
+"""
 from __future__ import annotations
+
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -9,7 +15,6 @@ from .models import (
     AcquireResponse,
     DriverReportRequest,
     GPUOut,
-    GPUState,
     MessageOut,
     PartitionOut,
     ReconfigRequest,
@@ -18,17 +23,34 @@ from .models import (
 )
 from .service import GPU, SchedulerError, SchedulerService
 
+
+def _build_service() -> SchedulerService:
+    raw_ids = os.environ.get("GPU_IDS", "").strip()
+    if raw_ids:
+        gpu_ids = tuple(x.strip() for x in raw_ids.split(",") if x.strip())
+        if not gpu_ids:
+            raise ValueError("GPU_IDS 解析后为空")
+        return SchedulerService(gpu_ids=gpu_ids)
+    raw_count = os.environ.get("GPU_COUNT", "").strip()
+    gpu_count = int(raw_count) if raw_count else 2
+    if gpu_count < 1:
+        raise ValueError("GPU_COUNT 必须为正整数")
+    return SchedulerService(gpu_count=gpu_count)
+
+
+service = _build_service()
+_TOTAL_GPUS = service.gpu_count  # 进程内模拟卡总数
+
 app = FastAPI(
     title="GPU 分区改配调度模拟器",
-    version="1.0.0",
+    version="2.0.0",
     description=(
-        "模拟两张 GPU（gpu-0、gpu-1），每张卡可切成一个大分区（large）或两个小分区（split）。"
-        "任务按规格领用分区、结束归还；值班员发起改配后该卡停接新任务，"
-        "分区全部归还才交给模拟驱动，另一张卡照常分配。"
+        f"模拟 {_TOTAL_GPUS} 张 GPU（gpu-0 …），每张卡可切成一个大分区（large）"
+        "或两个小分区（split）。任务按规格领用分区、结束归还；值班员发起改配后"
+        "该卡停接新任务，分区全部归还才交给模拟驱动，其他卡照常分配。"
+        "卡数由环境变量 GPU_COUNT（默认 2）或 GPU_IDS 配置。"
     ),
 )
-
-service = SchedulerService()
 
 
 @app.exception_handler(SchedulerError)
@@ -57,9 +79,9 @@ TAG_DRIVER = "模拟驱动：改配回报"
 TAG_ADMIN = "测试辅助"
 
 
-@app.get("/gpus", response_model=list[GPUOut], tags=[TAG_GPU], summary="查看两张卡的实时状态")
+@app.get("/gpus", response_model=list[GPUOut], tags=[TAG_GPU], summary="查看全部卡的实时状态")
 async def list_gpus() -> list[GPUOut]:
-    return [_gpu_to_out(g) for g in await service.snapshot()]
+    return [_gpu_to_out(gpu) for gpu in await service.snapshot()]
 
 
 @app.get("/gpus/{gpu_id}", response_model=GPUOut, tags=[TAG_GPU], summary="查看单卡状态")
@@ -72,6 +94,10 @@ async def get_gpu(gpu_id: str) -> GPUOut:
     response_model=AcquireResponse,
     tags=[TAG_TASK],
     summary="按规格领用分区（large 领大分区，small 领小分区）",
+    description=(
+        "只在 ACTIVE 卡的同规格空闲分区中分配，按卡初始化顺序、卡内分区编号"
+        "取第一个空位；无空位（含所有卡停接）返回 503。"
+    ),
     responses={409: {"model": MessageOut}, 503: {"model": MessageOut}},
 )
 async def acquire_partition(req: AcquireRequest) -> AcquireResponse:
@@ -83,7 +109,7 @@ async def acquire_partition(req: AcquireRequest) -> AcquireResponse:
     "/tasks/release",
     response_model=MessageOut,
     tags=[TAG_TASK],
-    summary="任务结束归还分区",
+    summary="任务结束归还分区；draining 卡借此自动推进到 reconfiguring",
     responses={404: {"model": MessageOut}},
 )
 async def release_partition(req: ReleaseRequest) -> MessageOut:
@@ -130,9 +156,9 @@ async def driver_report(req: DriverReportRequest) -> GPUOut:
 @app.post("/admin/reset", response_model=MessageOut, tags=[TAG_ADMIN], summary="重置为初始状态（测试用）")
 async def reset_state() -> MessageOut:
     await service.reset()
-    return MessageOut(detail="已重置：两张卡均为 large 大分区、ACTIVE、批次归零")
+    return MessageOut(detail=f"已重置：{_TOTAL_GPUS} 张卡均为 large 大分区、ACTIVE、批次归零")
 
 
 @app.get("/health", tags=[TAG_ADMIN], summary="健康检查")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "gpu_count": str(_TOTAL_GPUS)}

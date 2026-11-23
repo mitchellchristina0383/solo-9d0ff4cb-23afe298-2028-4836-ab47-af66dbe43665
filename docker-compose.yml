@@ -1,8 +1,11 @@
 services:
   gpu-scheduler:
     build: .
-    image: gpu-partition-scheduler:1.0.0
+    image: gpu-partition-scheduler:2.0.0
     container_name: gpu-partition-scheduler
+    environment:
+      # 模拟卡数：启动时按需调整，默认两张；也可用 GPU_IDS=gpu-a,gpu-b 显式指定卡 ID
+      GPU_COUNT: "${GPU_COUNT:-2}"
     ports:
       - "8000:8000"
     healthcheck:
